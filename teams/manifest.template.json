@@ -1,0 +1,43 @@
+{
+    "$schema": "https://developer.microsoft.com/en-us/json-schemas/teams/v1.17/MicrosoftTeams.schema.json",
+    "manifestVersion": "1.17",
+    "version": "1.0.0",
+    "id": "{{APP_ID}}",
+    "packageName": "com.meetwise.personal",
+    "developer": {
+        "name": "Meetwise",
+        "websiteUrl": "{{PUBLIC_APP_URL}}",
+        "privacyUrl": "{{PUBLIC_APP_URL}}",
+        "termsOfUseUrl": "{{PUBLIC_APP_URL}}"
+    },
+    "icons": {
+        "outline": "outline.png",
+        "color": "color.png"
+    },
+    "name": {
+        "short": "Meetwise",
+        "full": "Meetwise Meeting Intelligence"
+    },
+    "description": {
+        "short": "Meeting notes, actions, and reminders.",
+        "full": "Review meeting intelligence, action items, and follow-up reminders in Microsoft Teams."
+    },
+    "accentColor": "#5B5FC7",
+    "staticTabs": [
+        {
+            "entityId": "meetwise-home",
+            "name": "Meetwise",
+            "contentUrl": "{{PUBLIC_APP_URL}}",
+            "websiteUrl": "{{PUBLIC_APP_URL}}",
+            "scopes": [
+                "personal"
+            ]
+        }
+    ],
+    "validDomains": [
+        "{{PUBLIC_DOMAIN}}"
+    ],
+    "permissions": [
+        "identity"
+    ]
+}

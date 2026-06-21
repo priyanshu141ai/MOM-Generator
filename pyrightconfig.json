@@ -1,0 +1,15 @@
+{
+    "include": [
+        "prompt_ui.py",
+        "meeting_assistant",
+        "tests"
+    ],
+    "exclude": [
+        ".venv",
+        "__pycache__"
+    ],
+    "venvPath": ".",
+    "venv": ".venv",
+    "typeCheckingMode": "basic",
+    "pythonVersion": "3.11"
+}
