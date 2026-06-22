@@ -72,6 +72,10 @@ def queue_meeting_results(
             "UPDATE intelligence SET approved = 1 WHERE meeting_id = ?",
             (meeting_id,),
         )
+        connection.execute(
+            "UPDATE meetings SET status = 'Approved' WHERE id = ?",
+            (meeting_id,),
+        )
         connection.commit()
     return created
 

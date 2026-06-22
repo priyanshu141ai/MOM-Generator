@@ -12,7 +12,15 @@ def capture() -> None:
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(headless=True, executable_path=EDGE)
         page = browser.new_page(viewport={"width": 1440, "height": 1000})
-        page.set_default_timeout(5000)
+        console_errors: list[str] = []
+        page.on(
+            "console",
+            lambda message: console_errors.append(message.text)
+            if message.type == "error"
+            else None,
+        )
+        page.on("pageerror", lambda error: console_errors.append(str(error)))
+        page.set_default_timeout(15000)
         page.goto("http://localhost:8501", wait_until="domcontentloaded")
         page.locator(".teams-topbar").wait_for(state="visible")
         page.wait_for_timeout(1500)
@@ -49,6 +57,15 @@ def capture() -> None:
         page.wait_for_timeout(300)
         page.screenshot(path=OUTPUT / "teams-manage-meeting.png", full_page=True)
 
+        sidebar.get_by_text("Intelligence", exact=True).click()
+        page.get_by_role("heading", name="Meeting intelligence", exact=True).wait_for()
+        page.wait_for_timeout(700)
+        if page.get_by_text("Generate intelligence", exact=True).count() != 0:
+            raise AssertionError("Manual intelligence generation control is still visible")
+        if page.get_by_text("Upload transcript", exact=True).count() != 0:
+            raise AssertionError("Manual transcript upload control is still visible")
+        page.screenshot(path=OUTPUT / "teams-intelligence-automatic.png", full_page=True)
+
         sidebar.get_by_text("Action tracker", exact=True).click()
         page.get_by_role("heading", name="Action tracker", exact=True).wait_for()
         page.wait_for_timeout(300)
@@ -64,6 +81,8 @@ def capture() -> None:
         mobile.locator(".teams-topbar").wait_for(state="visible")
         mobile.wait_for_timeout(1500)
         mobile.screenshot(path=OUTPUT / "teams-mobile.png", full_page=True)
+        if console_errors:
+            raise AssertionError(f"Browser console errors: {console_errors}")
         browser.close()
 
 

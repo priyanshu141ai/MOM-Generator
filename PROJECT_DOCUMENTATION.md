@@ -50,12 +50,14 @@ If the assistant is not allowed, it does not collect or read the transcript.
 
 ### After a Meeting
 
-1. The transcript is sent to the AI engine.
-2. The AI engine creates notes, decisions, risks, and tasks.
-3. The organizer checks and edits the result.
-4. The organizer chooses who will receive it.
-5. The app adds the messages to the outbox.
-6. The reminder engine follows each task until it is complete.
+1. The app detects that the meeting ended.
+2. The transcript provider collects the transcript automatically.
+3. The transcript is sent to the AI engine.
+4. The AI engine creates notes, decisions, risks, and tasks.
+5. The organizer views the transcript and edits the draft.
+6. The organizer chooses who will receive it.
+7. The app adds the messages to the outbox.
+8. The reminder engine follows each task until it is complete.
 
 ## 5. The Two Reminder Systems
 
@@ -105,6 +107,14 @@ The screens are:
 
 It uses Azure OpenAI when company access is ready. It uses a simple demo reader when access is not ready.
 
+### Automation Service
+
+`meeting_assistant/automation.py` detects ended meetings, gets a transcript, starts AI processing, saves the draft, and schedules action reminders.
+
+`meeting_assistant/graph_transcripts.py` reads the transcript already created by Microsoft Teams. It uses Microsoft Graph. The app does not record the meeting itself.
+
+`meeting_assistant/worker.py` runs this work outside the web screen. This is the correct process for a hosted system.
+
 ### Reminder Service
 
 `meeting_assistant/reminders.py` creates meeting reminders and task reminders.
@@ -129,7 +139,10 @@ The current project uses a demo outbox. It does not send real messages yet.
 - Local meeting setup.
 - Optional AI permission.
 - Meeting reminders.
-- Transcript upload or paste.
+- Automatic meeting-end detection.
+- Automatic demo transcript collection.
+- Automatic Microsoft Teams transcript retrieval through Microsoft Graph when tenant access is configured.
+- Read-only transcript viewing for the organizer.
 - Demo transcript reading.
 - Azure OpenAI connection support.
 - MOM, summary, decisions, risks, and action items.
@@ -174,6 +187,7 @@ Langchain_prompt/
 |   |-- __init__.py
 |   |-- database.py
 |   |-- ai_engine.py
+|   |-- automation.py
 |   |-- reminders.py
 |   `-- communications.py
 `-- tests/
@@ -186,8 +200,8 @@ Langchain_prompt/
 
 1. Connect Microsoft login.
 2. Read calendar meetings from Microsoft Graph.
-3. Add an approved Teams meeting assistant.
-4. Collect transcripts only with permission.
+3. Add calendar meeting discovery and Graph webhook subscriptions.
+4. Approve transcript access and the application access policy.
 5. Send real email and Teams messages.
 6. Add company data rules and audit logs.
 7. Deploy the app on an approved company server.

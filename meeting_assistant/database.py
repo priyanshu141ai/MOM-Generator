@@ -52,6 +52,12 @@ def init_db(db_path: Path | str = DB_PATH, seed: bool = True) -> None:
                 assistant_enabled INTEGER NOT NULL DEFAULT 0,
                 status TEXT NOT NULL DEFAULT 'Scheduled',
                 teams_channel TEXT,
+                graph_online_meeting_id TEXT,
+                graph_organizer_user_id TEXT,
+                join_web_url TEXT,
+                automation_attempts INTEGER NOT NULL DEFAULT 0,
+                next_automation_attempt TEXT,
+                last_automation_error TEXT,
                 created_at TEXT NOT NULL
             );
 
@@ -73,6 +79,13 @@ def init_db(db_path: Path | str = DB_PATH, seed: bool = True) -> None:
                 risks TEXT NOT NULL,
                 approved INTEGER NOT NULL DEFAULT 0,
                 generated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS transcripts (
+                meeting_id INTEGER PRIMARY KEY REFERENCES meetings(id) ON DELETE CASCADE,
+                content TEXT NOT NULL,
+                source TEXT NOT NULL,
+                collected_at TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS actions (
@@ -121,11 +134,36 @@ def init_db(db_path: Path | str = DB_PATH, seed: bool = True) -> None:
         }
         if "dedupe_key" not in notification_columns:
             connection.execute("ALTER TABLE notifications ADD COLUMN dedupe_key TEXT")
+        meeting_columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(meetings)").fetchall()
+        }
+        meeting_migrations = {
+            "graph_online_meeting_id": "TEXT",
+            "graph_organizer_user_id": "TEXT",
+            "join_web_url": "TEXT",
+            "automation_attempts": "INTEGER NOT NULL DEFAULT 0",
+            "next_automation_attempt": "TEXT",
+            "last_automation_error": "TEXT",
+        }
+        for column, definition in meeting_migrations.items():
+            if column not in meeting_columns:
+                connection.execute(
+                    f"ALTER TABLE meetings ADD COLUMN {column} {definition}"
+                )
         connection.execute(
             """
             CREATE UNIQUE INDEX IF NOT EXISTS idx_notifications_dedupe
             ON notifications(dedupe_key)
             WHERE dedupe_key IS NOT NULL
+            """
+        )
+        connection.execute(
+            """
+            UPDATE meetings
+            SET status = 'Review ready'
+            WHERE status = 'Scheduled'
+              AND id IN (SELECT meeting_id FROM intelligence)
             """
         )
     if seed:
@@ -167,6 +205,9 @@ def create_meeting(
     assistant_enabled: bool,
     attendees: list[tuple[str, str]],
     teams_channel: str = "",
+    graph_online_meeting_id: str = "",
+    graph_organizer_user_id: str = "",
+    join_web_url: str = "",
     db_path: Path | str = DB_PATH,
 ) -> int:
     if not title.strip():
@@ -186,8 +227,9 @@ def create_meeting(
             """
             INSERT INTO meetings
                 (title, start_time, end_time, organizer_name, organizer_email,
-                 assistant_enabled, status, teams_channel, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, 'Scheduled', ?, ?)
+                 assistant_enabled, status, teams_channel, graph_online_meeting_id,
+                 graph_organizer_user_id, join_web_url, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, 'Scheduled', ?, ?, ?, ?, ?)
             """,
             (
                 title.strip(),
@@ -197,6 +239,9 @@ def create_meeting(
                 organizer_email.strip().lower(),
                 int(assistant_enabled),
                 teams_channel.strip(),
+                graph_online_meeting_id.strip() or None,
+                graph_organizer_user_id.strip() or None,
+                join_web_url.strip() or None,
                 now_iso(),
             ),
         )
@@ -238,6 +283,222 @@ def get_meetings(db_path: Path | str = DB_PATH) -> list[dict[str, Any]]:
 
 def get_meeting(meeting_id: int, db_path: Path | str = DB_PATH) -> dict[str, Any] | None:
     return fetch_one("SELECT * FROM meetings WHERE id = ?", (meeting_id,), db_path)
+
+
+def get_meetings_with_status(
+    status: str, db_path: Path | str = DB_PATH
+) -> list[dict[str, Any]]:
+    return fetch_all(
+        "SELECT * FROM meetings WHERE status = ? ORDER BY end_time",
+        (status,),
+        db_path,
+    )
+
+
+def set_meeting_status(
+    meeting_id: int, status: str, db_path: Path | str = DB_PATH
+) -> None:
+    allowed = {
+        "Scheduled",
+        "Meeting ended",
+        "Processing",
+        "Review ready",
+        "Approved",
+        "Completed",
+        "Automation failed",
+        "Waiting for transcript",
+        "Needs attention",
+    }
+    if status not in allowed:
+        raise ValueError("Meeting status is not valid.")
+    execute(
+        "UPDATE meetings SET status = ? WHERE id = ?",
+        (status, meeting_id),
+        db_path,
+    )
+
+
+def mark_due_meetings_ended(
+    at: datetime | None = None, db_path: Path | str = DB_PATH
+) -> int:
+    current = (at or datetime.now()).replace(microsecond=0).isoformat()
+    with db_session(db_path) as connection:
+        cursor = connection.execute(
+            """
+            UPDATE meetings
+            SET status = 'Meeting ended'
+            WHERE status = 'Scheduled' AND end_time <= ?
+            """,
+            (current,),
+        )
+        return cursor.rowcount
+
+
+def claim_meeting_for_processing(
+    meeting_id: int, db_path: Path | str = DB_PATH
+) -> bool:
+    with db_session(db_path) as connection:
+        cursor = connection.execute(
+            """
+            UPDATE meetings
+            SET status = 'Processing', next_automation_attempt = NULL
+            WHERE id = ?
+              AND status IN ('Meeting ended', 'Waiting for transcript', 'Automation failed')
+            """,
+            (meeting_id,),
+        )
+        return cursor.rowcount == 1
+
+
+def get_automation_candidates(
+    at: datetime | None = None, db_path: Path | str = DB_PATH
+) -> list[dict[str, Any]]:
+    current = (at or datetime.now()).replace(microsecond=0).isoformat()
+    return fetch_all(
+        """
+        SELECT * FROM meetings
+        WHERE status IN ('Meeting ended', 'Waiting for transcript', 'Automation failed')
+          AND (next_automation_attempt IS NULL OR next_automation_attempt <= ?)
+        ORDER BY COALESCE(next_automation_attempt, end_time)
+        """,
+        (current,),
+        db_path,
+    )
+
+
+def schedule_automation_retry(
+    meeting_id: int,
+    status: str,
+    delay_seconds: int,
+    error_message: str,
+    db_path: Path | str = DB_PATH,
+) -> None:
+    if status not in {"Waiting for transcript", "Automation failed"}:
+        raise ValueError("Automation retry status is not valid.")
+    next_attempt = datetime.now() + timedelta(seconds=max(delay_seconds, 1))
+    with db_session(db_path) as connection:
+        connection.execute(
+            """
+            UPDATE meetings
+            SET status = ?,
+                automation_attempts = automation_attempts + 1,
+                next_automation_attempt = ?,
+                last_automation_error = ?
+            WHERE id = ?
+            """,
+            (
+                status,
+                next_attempt.replace(microsecond=0).isoformat(),
+                error_message[:500],
+                meeting_id,
+            ),
+        )
+
+
+def mark_automation_complete(
+    meeting_id: int, status: str, db_path: Path | str = DB_PATH
+) -> None:
+    if status not in {"Review ready", "Completed", "Approved"}:
+        raise ValueError("Automation completion status is not valid.")
+    with db_session(db_path) as connection:
+        connection.execute(
+            """
+            UPDATE meetings
+            SET status = ?, next_automation_attempt = NULL, last_automation_error = NULL
+            WHERE id = ?
+            """,
+            (status, meeting_id),
+        )
+
+
+def mark_automation_attention(
+    meeting_id: int,
+    error_message: str,
+    db_path: Path | str = DB_PATH,
+) -> None:
+    with db_session(db_path) as connection:
+        connection.execute(
+            """
+            UPDATE meetings
+            SET status = 'Needs attention',
+                automation_attempts = automation_attempts + 1,
+                next_automation_attempt = NULL,
+                last_automation_error = ?
+            WHERE id = ?
+            """,
+            (error_message[:500], meeting_id),
+        )
+
+
+def link_graph_meeting(
+    meeting_id: int,
+    online_meeting_id: str,
+    organizer_user_id: str,
+    join_web_url: str = "",
+    db_path: Path | str = DB_PATH,
+) -> None:
+    if not online_meeting_id.strip() or not organizer_user_id.strip():
+        raise ValueError("Graph meeting ID and organizer user ID are required.")
+    with db_session(db_path) as connection:
+        cursor = connection.execute(
+            """
+            UPDATE meetings
+            SET graph_online_meeting_id = ?, graph_organizer_user_id = ?, join_web_url = ?,
+                status = CASE WHEN status = 'Needs attention' THEN 'Meeting ended' ELSE status END,
+                next_automation_attempt = NULL,
+                last_automation_error = NULL
+            WHERE id = ?
+            """,
+            (
+                online_meeting_id.strip(),
+                organizer_user_id.strip(),
+                join_web_url.strip() or None,
+                meeting_id,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise ValueError("This meeting could not be found.")
+
+
+def save_transcript(
+    meeting_id: int,
+    content: str,
+    source: str,
+    db_path: Path | str = DB_PATH,
+) -> None:
+    if not content.strip():
+        raise ValueError("The transcript is empty.")
+    execute(
+        """
+        INSERT INTO transcripts (meeting_id, content, source, collected_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(meeting_id) DO UPDATE SET
+            content = excluded.content,
+            source = excluded.source,
+            collected_at = excluded.collected_at
+        """,
+        (meeting_id, content.strip(), source, now_iso()),
+        db_path,
+    )
+
+
+def get_transcript(
+    meeting_id: int, db_path: Path | str = DB_PATH
+) -> dict[str, Any] | None:
+    transcript = fetch_one(
+        "SELECT * FROM transcripts WHERE meeting_id = ?", (meeting_id,), db_path
+    )
+    if transcript:
+        return transcript
+    intelligence = get_intelligence(meeting_id, db_path)
+    if not intelligence:
+        return None
+    return {
+        "meeting_id": meeting_id,
+        "content": intelligence["transcript"],
+        "source": "Existing meeting record",
+        "collected_at": intelligence["generated_at"],
+    }
 
 
 def set_meeting_assistant(
@@ -427,7 +688,7 @@ def seed_demo_data(db_path: Path | str = DB_PATH) -> None:
             ("Neha Singh", "neha.singh@contoso.com"),
         ],
         "Project Phoenix",
-        db_path,
+        db_path=db_path,
     )
 
     transcript = (
@@ -479,5 +740,5 @@ def seed_demo_data(db_path: Path | str = DB_PATH) -> None:
             ("Priya Nair", "priya.nair@contoso.com"),
         ],
         "People Operations",
-        db_path,
+        db_path=db_path,
     )

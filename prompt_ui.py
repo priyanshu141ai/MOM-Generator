@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import html
-import json
 import logging
 import os
 import sqlite3
@@ -11,7 +10,12 @@ import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
 
-from meeting_assistant.ai_engine import analyze_transcript, azure_is_configured
+from meeting_assistant.ai_engine import azure_is_configured
+from meeting_assistant.automation import (
+    run_automation,
+    simulate_meeting_ended,
+    transcript_provider_label,
+)
 from meeting_assistant.communications import (
     get_notifications,
     mark_notification_sent,
@@ -26,7 +30,9 @@ from meeting_assistant.database import (
     get_intelligence,
     get_meeting,
     get_meetings,
+    get_transcript,
     init_db,
+    link_graph_meeting,
     replace_actions,
     save_intelligence,
     set_meeting_assistant,
@@ -38,11 +44,11 @@ from meeting_assistant.reminders import (
     schedule_action_reminders,
     schedule_meeting_reminders,
 )
+from meeting_assistant.graph_transcripts import graph_is_configured
 
 
 load_dotenv()
 LOGGER = logging.getLogger(__name__)
-MAX_UPLOAD_BYTES = 1_000_000
 st.set_page_config(
     page_title="Meetwise | Meeting Intelligence",
     page_icon="M",
@@ -55,6 +61,26 @@ except sqlite3.DatabaseError:
     LOGGER.exception("Database initialization failed")
     st.error("The local database could not be opened. Ask an administrator to check the data file.")
     st.stop()
+
+
+if os.getenv("AUTOMATION_IN_UI", "true").strip().lower() == "true":
+    poll_seconds = max(int(os.getenv("AUTOMATION_POLL_SECONDS", "30")), 10)
+
+    @st.fragment(run_every=f"{poll_seconds}s")
+    def automation_monitor() -> None:
+        try:
+            result = run_automation()
+            if (
+                result.processed
+                or result.completed_without_ai
+                or result.waiting_for_transcript
+                or result.failed
+            ):
+                st.rerun()
+        except sqlite3.DatabaseError:
+            LOGGER.exception("Automatic meeting monitor failed")
+
+    automation_monitor()
 
 
 st.markdown(
@@ -451,12 +477,92 @@ elif page == "Meetings":
                     f"**Organizer:** {meeting['organizer_name']} ({meeting['organizer_email']})"
                 )
                 st.write(f"**Teams channel:** {meeting['teams_channel'] or 'Not selected'}")
+                st.write(f"**Automation status:** {meeting['status']}")
                 badge = "Assistant enabled" if meeting["assistant_enabled"] else "Reminders only"
                 st.info(badge)
             with right:
                 st.subheader("Participants")
                 for attendee in attendees:
                     st.write(f"**{attendee['name']}** ({attendee['email']})")
+            st.divider()
+            if os.getenv("TRANSCRIPT_PROVIDER", "demo").strip().lower() == "microsoft_graph":
+                st.subheader("Microsoft Teams meeting link")
+                linked = bool(
+                    meeting.get("graph_online_meeting_id")
+                    and meeting.get("graph_organizer_user_id")
+                )
+                if linked:
+                    st.success("This meeting is linked to Microsoft Graph.")
+                else:
+                    st.warning(
+                        "This meeting is not linked. Automatic Teams transcript retrieval cannot start."
+                    )
+                with st.form(f"graph_link_{meeting_id}"):
+                    graph_meeting_id = st.text_input(
+                        "Teams online meeting ID",
+                        value=str(meeting.get("graph_online_meeting_id") or ""),
+                    )
+                    graph_organizer_id = st.text_input(
+                        "Organizer Entra user ID",
+                        value=str(meeting.get("graph_organizer_user_id") or ""),
+                    )
+                    graph_join_url = st.text_input(
+                        "Teams join URL (optional)",
+                        value=str(meeting.get("join_web_url") or ""),
+                    )
+                    save_graph_link = st.form_submit_button(
+                        "Save Teams meeting link", icon=":material/link:"
+                    )
+                if save_graph_link:
+                    try:
+                        link_graph_meeting(
+                            meeting_id,
+                            graph_meeting_id,
+                            graph_organizer_id,
+                            graph_join_url,
+                        )
+                        st.success("Microsoft Graph meeting link saved.")
+                        st.rerun()
+                    except (ValueError, sqlite3.DatabaseError) as exc:
+                        st.error(
+                            str(exc)
+                            if isinstance(exc, ValueError)
+                            else "The Teams meeting link could not be saved."
+                        )
+                st.divider()
+            st.subheader("Automatic processing")
+            if os.getenv("TRANSCRIPT_PROVIDER", "demo").strip().lower() == "demo":
+                st.caption(
+                    "Use this control to test what happens after Teams reports that the meeting has ended. No transcript upload is needed."
+                )
+                if meeting["status"] not in {"Processing", "Review ready", "Approved", "Completed"}:
+                    if st.button(
+                        "Simulate meeting ended",
+                        type="primary",
+                        icon=":material/stop_circle:",
+                    ):
+                        try:
+                            result = simulate_meeting_ended(meeting_id)
+                            if result.processed:
+                                st.success("Meeting processed. The organizer review is ready.")
+                            elif result.completed_without_ai:
+                                st.success("Meeting completed without transcript processing.")
+                            else:
+                                st.error("Automatic processing failed. Check the application log.")
+                            st.rerun()
+                        except (ValueError, sqlite3.DatabaseError) as exc:
+                            LOGGER.exception("Meeting end simulation failed")
+                            st.error(
+                                str(exc)
+                                if isinstance(exc, ValueError)
+                                else "The meeting could not be processed."
+                            )
+                else:
+                    st.caption(f"Current status: {meeting['status']}")
+            else:
+                st.caption(
+                    "The production worker detects the meeting end and retrieves the Teams transcript automatically. Demo simulation is disabled in Graph mode."
+                )
             st.divider()
             st.subheader("AI assistant access")
             assistant_choice = st.radio(
@@ -513,9 +619,9 @@ elif page == "Meetings":
 
 elif page == "Intelligence":
     page_header(
-        "Organizer review",
+        "Automatic organizer review",
         "Meeting intelligence",
-        "Generate a structured record from an authorized transcript, edit it, then approve recipients and distribution.",
+        "Meeting records are created automatically after an authorized meeting ends. Review, edit, and approve them here.",
     )
     meeting_id = meeting_selector("Meeting with assistant enabled", assistant_only=True)
     if meeting_id:
@@ -525,71 +631,45 @@ elif page == "Intelligence":
             st.stop()
         attendees = get_attendees(meeting_id)
         existing = get_intelligence(meeting_id)
+        transcript_record = get_transcript(meeting_id)
         if not meeting["assistant_enabled"]:
             st.error("The assistant was not enabled for this meeting. Transcript processing is blocked.")
             st.stop()
 
-        provider = "Azure OpenAI" if azure_is_configured() else "Demo intelligence"
-        st.caption(f"Processing provider: {provider}")
-        transcript_upload = st.file_uploader("Upload transcript", type=["txt", "md"])
-        uploaded_text = ""
-        if transcript_upload:
-            upload_bytes = transcript_upload.getvalue()
-            if len(upload_bytes) > MAX_UPLOAD_BYTES:
-                st.error("The transcript file is too large. Use a UTF-8 text file under 1 MB.")
-                st.stop()
-            try:
-                uploaded_text = upload_bytes.decode("utf-8")
-            except UnicodeDecodeError:
-                st.error("The transcript must be a UTF-8 text file.")
-                st.stop()
-        transcript = st.text_area(
-            "Transcript",
-            value=uploaded_text or (existing["transcript"] if existing else ""),
-            height=190,
-            placeholder="Aarav: We agreed to...\nRahul: I will submit... by 2026-06-25.",
-        )
-        if st.button(
-            "Generate intelligence",
-            type="primary",
-            icon=":material/auto_awesome:",
-        ):
-            try:
-                with st.spinner("Extracting decisions, actions, and risks..."):
-                    result = analyze_transcript(transcript, meeting["title"], attendees)
-                    save_intelligence(
-                        meeting_id,
-                        transcript,
-                        result.summary,
-                        result.mom,
-                        result.decisions,
-                        result.risks,
-                    )
-                    replace_actions(
-                        meeting_id,
-                        [
-                            {
-                                "owner_name": action.owner_name,
-                                "owner_email": action.owner_email,
-                                "task": action.task,
-                                "due_date": action.due_date,
-                            }
-                            for action in result.actions
-                        ],
-                    )
-                    schedule_action_reminders(meeting_id)
-                st.success(f"Draft generated with {result.provider}. Review it below.")
-                st.rerun()
-            except (ValueError, json.JSONDecodeError):
-                LOGGER.exception("Transcript validation or model output failed")
-                st.error("The transcript could not be processed. Check its format and try again.")
-            except Exception:
-                LOGGER.exception("Meeting intelligence generation failed")
-                st.error("The AI service is not available right now. Try again later.")
+        ai_provider = "Azure OpenAI" if azure_is_configured() else "Demo AI analysis"
+        status_cols = st.columns(3)
+        status_cols[0].metric("Automation status", meeting["status"])
+        status_cols[1].metric("Transcript source", transcript_provider_label())
+        status_cols[2].metric("AI engine", ai_provider)
 
-        existing = get_intelligence(meeting_id)
+        if meeting["status"] == "Scheduled":
+            st.info("Waiting for the meeting to end. Processing will start automatically.")
+        elif meeting["status"] in {"Meeting ended", "Processing"}:
+            st.info("The meeting ended and its intelligence is being prepared.")
+        elif meeting["status"] == "Waiting for transcript":
+            st.info("Teams has not published the transcript yet. The worker will retry automatically.")
+        elif meeting["status"] == "Automation failed":
+            st.error("Automatic processing failed. Retry it from Manage Meetings.")
+
+        transcript = (
+            str(transcript_record["content"])
+            if transcript_record
+            else str(existing["transcript"] if existing else "")
+        )
         if existing:
             st.divider()
+            with st.expander("View meeting transcript", expanded=False):
+                if transcript_record:
+                    st.caption(
+                        f"Source: {transcript_record['source']} | Collected: {transcript_record['collected_at']}"
+                    )
+                st.text_area(
+                    "Transcript",
+                    value=transcript,
+                    height=260,
+                    disabled=True,
+                    key=f"transcript_view_{meeting_id}",
+                )
             st.subheader("Review draft")
             with st.form("review_intelligence"):
                 summary = st.text_area("Executive summary", existing["summary"], height=110) or ""
@@ -856,7 +936,7 @@ elif page == "Integrations":
     with left:
         st.subheader("Connection status")
         azure_status = "Connected" if azure_is_configured() else "Demo fallback"
-        graph_configured = bool(os.getenv("MS_GRAPH_CLIENT_ID"))
+        graph_configured = graph_is_configured()
         graph_status = "Configured" if graph_configured else "Awaiting access"
         st.markdown(
             f"""

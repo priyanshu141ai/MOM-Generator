@@ -6,10 +6,14 @@ from pathlib import Path
 from unittest.mock import patch
 
 from meeting_assistant.ai_engine import analyze_transcript
+from meeting_assistant.automation import simulate_meeting_ended
 from meeting_assistant.communications import get_notifications, queue_meeting_results
 from meeting_assistant.database import (
     create_meeting,
     get_actions,
+    get_intelligence,
+    get_meeting,
+    get_transcript,
     init_db,
     replace_actions,
     save_intelligence,
@@ -62,12 +66,39 @@ class MeetingAssistantServicesTest(unittest.TestCase):
 
         set_meeting_assistant(meeting_id, True, self.db_path)
 
-        from meeting_assistant.database import get_meeting
-
         meeting = get_meeting(meeting_id, self.db_path)
         self.assertIsNotNone(meeting)
         assert meeting is not None
         self.assertEqual(meeting["assistant_enabled"], 1)
+
+    def test_ended_meeting_is_processed_automatically(self) -> None:
+        meeting_id, _ = self.create_test_meeting(assistant_enabled=True)
+
+        result = simulate_meeting_ended(meeting_id, self.db_path)
+
+        meeting = get_meeting(meeting_id, self.db_path)
+        assert meeting is not None
+        self.assertEqual(result.processed, 1)
+        self.assertEqual(meeting["status"], "Review ready")
+        self.assertIsNotNone(get_transcript(meeting_id, self.db_path))
+        self.assertIsNotNone(get_intelligence(meeting_id, self.db_path))
+        self.assertGreaterEqual(len(get_actions(meeting_id, self.db_path)), 1)
+        self.assertGreaterEqual(len(get_reminders(self.db_path)), 4)
+
+        with self.assertRaisesRegex(ValueError, "already been processed"):
+            simulate_meeting_ended(meeting_id, self.db_path)
+
+    def test_ended_meeting_without_assistant_skips_transcript(self) -> None:
+        meeting_id, _ = self.create_test_meeting(assistant_enabled=False)
+
+        result = simulate_meeting_ended(meeting_id, self.db_path)
+
+        meeting = get_meeting(meeting_id, self.db_path)
+        assert meeting is not None
+        self.assertEqual(result.completed_without_ai, 1)
+        self.assertEqual(meeting["status"], "Completed")
+        self.assertIsNone(get_transcript(meeting_id, self.db_path))
+        self.assertIsNone(get_intelligence(meeting_id, self.db_path))
 
     def test_local_analysis_extracts_actions_decisions_and_risks(self) -> None:
         transcript = (

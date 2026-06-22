@@ -1,63 +1,86 @@
 # Production Readiness Check
 
-This file explains what is protected now and what still needs company access.
+This file explains what works now and what must be completed before company use.
 
-## Risks Fixed in This Prototype
+## What the App Does Now
 
-### Database Use
+- The organizer chooses if AI is allowed for each meeting.
+- Meetings without AI still get normal calendar reminders.
+- The worker detects ended meetings.
+- Demo mode creates a sample transcript.
+- Microsoft Graph mode reads the transcript created by Teams.
+- The worker creates the summary, MOM, decisions, risks, and action items.
+- The organizer can read the transcript and edit the draft.
+- Sending remains manual and needs organizer approval.
+- Action reminders are created after AI processing.
 
-- SQLite waits when another process is writing.
-- Write work uses transactions.
-- The database uses WAL mode for safer local use.
-- Meeting, email, date, task, and status values are checked.
+## Production Design
 
-### Duplicate Work
+A hosted system should use these parts:
 
-- The same meeting reminder is not added twice.
-- The same approved meeting message is not added twice.
-- A completed action cancels its waiting reminders.
-- A completed action cannot create a new reminder message.
+1. A Teams personal app or tab for the user screen.
+2. Microsoft Entra sign-in and role checks.
+3. A web service for the screen and API.
+4. A separate worker for transcript and AI jobs.
+5. Microsoft Graph for calendar, meeting, transcript, and message data.
+6. Azure OpenAI for meeting intelligence.
+7. Azure SQL or PostgreSQL for shared data.
+8. Azure Key Vault for secrets.
+9. Application Insights for logs, errors, and alerts.
 
-### AI Processing
+Do not run many app copies with the current SQLite file. SQLite is only for local demo use.
 
-- Empty and very large transcripts are blocked.
-- Uploaded files must be UTF-8 text and under 1 MB.
-- The AI prompt treats transcript text as untrusted data.
-- Azure OpenAI has a timeout and three retries.
-- AI JSON and action dates are checked before saving.
-- AI errors shown to users do not include secret details.
+## Microsoft Setup Needed
 
-### User Interface
+- A Microsoft 365 work or school tenant.
+- An Entra app registration.
+- Admin consent for `OnlineMeetingTranscript.Read.All`.
+- The approved online meeting permissions needed to find meetings.
+- A cloud communications application access policy.
+- Teams transcription enabled for the meeting.
+- A Graph change notification subscription created before transcription starts.
+- Subscription renewal because Graph subscriptions expire.
 
-- Database text is escaped before it is placed in custom HTML.
-- Important save and send actions show safe error messages.
-- The interface follows a compact Teams and Fluent style.
-- Desktop and mobile pages are checked with automated tests.
+The current code can read a linked Teams meeting transcript. It does not yet discover every calendar meeting or create and renew Graph webhook subscriptions. These are required for a fully automatic company rollout.
 
-## Checks That Pass
+## Failure Handling Added
 
-- Python compilation.
-- Pyright: zero errors and zero warnings.
-- Seven service and screen tests.
-- Streamlit health check.
+- Graph throttling and server errors use retry and backoff.
+- `Retry-After` is followed for Graph throttling.
+- A transcript that is not ready is checked again later.
+- Permission, meeting link, and size errors move to **Needs attention**.
+- Unexpected errors stop retrying after the retry limit.
+- An atomic database claim prevents two workers from processing one meeting at the same time.
+- Reminder and outbox records use duplicate protection.
 
-## Work Needed Before Production
+## Security Work Before Launch
 
-These items cannot be completed without the company Microsoft tenant:
+1. Add Microsoft sign-in and check access for every meeting.
+2. Use certificate login or a managed identity instead of a client secret where possible.
+3. Store secrets in Azure Key Vault, not `.env`.
+4. Encrypt stored meeting data and backups.
+5. Add audit logs for transcript access, edits, approval, and sending.
+6. Add data retention and deletion rules.
+7. Remove private data from application logs.
+8. Run privacy, security, and penetration tests.
 
-1. Register the app in Microsoft Entra.
-2. Use the smallest approved Microsoft Graph permissions.
-3. Add Microsoft login and check user roles.
-4. Build and approve the Teams app or meeting bot.
-5. Record clear consent before collecting a transcript.
-6. Handle Graph rate limits and `Retry-After` responses.
-7. Send messages through an approved Graph or email service.
-8. Store secrets in Azure Key Vault instead of a local `.env` file.
-9. Move from local SQLite to an approved managed database.
-10. Add company logging, monitoring, backup, and alert rules.
-11. Add data retention and deletion rules.
-12. Complete security, privacy, and load testing.
+## Operations Work Before Launch
 
-## Important Limit
+1. Move SQLite data to Azure SQL or PostgreSQL.
+2. Run the web app and worker as separate services.
+3. Add health checks for the web app, worker, database, Graph, and Azure OpenAI.
+4. Add alerts for failed jobs, old waiting jobs, Graph permission errors, and outbox failures.
+5. Add database backup and restore tests.
+6. Add load tests with long transcripts and many meetings ending together.
+7. Add a dead-letter job screen for **Needs attention** items.
+8. Add calendar sync and Graph webhook subscription renewal.
 
-The current Streamlit screen looks and behaves like a Teams work tool. A true native Teams experience needs a Teams personal app or tab, a Teams manifest, Microsoft sign-in, and a hosted HTTPS address. A React interface using Fluent UI may be chosen later if the company needs exact Teams controls and single sign-on.
+## Current Verification
+
+- Pyright reports zero errors and zero warnings.
+- Automated service, Graph, retry, and screen tests pass.
+- Installed Python packages have no broken dependencies.
+
+## Release Decision
+
+The project is ready for a local demo and for Graph testing inside a company test tenant. It is not ready for real company data until sign-in, managed storage, Graph subscription management, monitoring, and privacy controls are complete.

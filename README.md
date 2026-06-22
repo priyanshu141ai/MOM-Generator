@@ -6,7 +6,8 @@ The app can:
 
 - Save meeting details.
 - Send meeting reminders.
-- Read a meeting transcript when the AI assistant is allowed.
+- Detect when an authorized meeting ends.
+- Collect a Teams transcript automatically through Microsoft Graph when company access is configured.
 - Create Minutes of Meeting (MOM).
 - Create a short meeting summary.
 - Find decisions, risks, and action items.
@@ -21,6 +22,26 @@ When the assistant is **on**, the app can use the transcript and create meeting 
 
 When the assistant is **off**, the app cannot use a transcript. It can only send normal meeting reminders.
 
+## Automatic Workflow
+
+When an authorized meeting ends, Meetwise automatically gets the transcript and creates the summary, MOM, decisions, risks, and action items. The organizer does not upload a transcript or start AI processing manually.
+
+Demo mode creates a sample transcript. Microsoft Graph mode reads the transcript already made by Teams. Use **Meetings > Manage meetings > Simulate meeting ended** to test demo mode. The organizer can then view the read-only transcript and edit the draft in **Intelligence**. Sending is always manual.
+
+## Production Processes
+
+Production needs two running processes:
+
+```powershell
+# Web screen
+.\.venv\Scripts\python.exe -m streamlit run prompt_ui.py
+
+# Automatic transcript worker
+.\.venv\Scripts\python.exe -m meeting_assistant.worker
+```
+
+Set `AUTOMATION_IN_UI=false` when the worker is running.
+
 ## Start the App
 
 Open PowerShell in this folder:
@@ -32,6 +53,9 @@ streamlit run prompt_ui.py
 ```
 
 The app will open at `http://localhost:8501`.
+
+For complete setup, startup, shutdown, and troubleshooting commands, read
+[RUN_GUIDE.md](RUN_GUIDE.md).
 
 ## Demo Mode
 
